@@ -41,7 +41,7 @@ static void help(void) __attribute__ ((noreturn));
 static void help(void)
 {
 	fprintf(stderr,
-		"Usage: i2cget [-f] [-y] I2CBUS CHIP-ADDRESS [DATA-ADDRESS [MODE]]\n"
+		"Usage: i2cget [-f] [-y] [-l <length>] I2CBUS CHIP-ADDRESS [DATA-ADDRESS [MODE]]\n"
 		"  I2CBUS is an integer or an I2C bus name\n"
 		"  ADDRESS is an integer (0x03 - 0x77)\n"
 		"  MODE is one of:\n"
@@ -150,15 +150,37 @@ static int confirm(const char *filename, int address, int size, int daddress,
 	return 1;
 }
 
+static void writeaddr(int file, int adr, int len)
+{
+#define MAX_ADDR_LEN 2
+
+	char buf[MAX_ADDR_LEN];
+	int i;
+
+	if (adr >= 0) {
+		if (len > MAX_ADDR_LEN)
+			len = MAX_ADDR_LEN;
+
+		for (i = 0; i < len; i++)
+			buf[i] = (adr >> (8 * (len - 1 - i))) & 0xff;
+
+		if (write(file, buf, len) != len)
+			fprintf(stderr, "Warning - write failed\n");
+	}
+}
+
 int main(int argc, char *argv[])
 {
+	int res, i;
+	char *resbufptr;
 	char *end;
-	int res, i2cbus, address, size, file;
-	int daddress;
+	int i2cbus, address, size, file;
+	int daddress, daddrlen = 0;
 	char filename[20];
 	int pec = 0;
 	int flags = 0;
 	int force = 0, yes = 0, version = 0;
+	int length = 0;
 
 	/* handle (optional) flags first */
 	while (1+flags < argc && argv[1+flags][0] == '-') {
@@ -166,6 +188,20 @@ int main(int argc, char *argv[])
 		case 'V': version = 1; break;
 		case 'f': force = 1; break;
 		case 'y': yes = 1; break;
+		case 'l': /* Number of bytes to read */
+			/* Handle both options:
+			 * - length is part of this argument
+			 * - length is the next argument. */
+			length = strtol(argv[1+flags] + 2, &end, 0);
+			if (!*end && !length && (2+flags < argc)) {
+				length = strtol(argv[2+flags], &end, 0);
+				flags++;
+			}
+			if (*end || !length) {
+				fprintf(stderr, "Error: Length not specified\n");
+				exit(1);
+			}
+			break;
 		default:
 			fprintf(stderr, "Error: Unsupported option "
 				"\"%s\"!\n", argv[1+flags]);
@@ -194,7 +230,11 @@ int main(int argc, char *argv[])
 	if (argc > flags + 3) {
 		size = I2C_SMBUS_BYTE_DATA;
 		daddress = strtol(argv[flags+3], &end, 0);
-		if (*end || daddress < 0 || daddress > 0xff) {
+		if (!*end && daddress >= 0) {
+			while (daddress >> (8 * daddrlen))
+				++daddrlen;
+		}
+		else {
 			fprintf(stderr, "Error: Data address invalid!\n");
 			help();
 		}
@@ -231,29 +271,64 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	switch (size) {
-	case I2C_SMBUS_BYTE:
-		if (daddress >= 0) {
-			res = i2c_smbus_write_byte(file, daddress);
-			if (res < 0)
-				fprintf(stderr, "Warning - write failed\n");
+	if (length) { /* Arbitrary number of bytes to be read */
+		if (!(resbufptr = calloc(length, sizeof(int)))) {
+			fprintf(stderr, "Error: Could not allocate buffer memory.\n");
+			close(file);
+			exit(1);
 		}
-		res = i2c_smbus_read_byte(file);
-		break;
-	case I2C_SMBUS_WORD_DATA:
-		res = i2c_smbus_read_word_data(file, daddress);
-		break;
-	default: /* I2C_SMBUS_BYTE_DATA */
-		res = i2c_smbus_read_byte_data(file, daddress);
+
+		writeaddr(file, daddress, daddrlen);
+		res = read(file, resbufptr, length);
 	}
+	else {
+		switch (size) {
+		case I2C_SMBUS_BYTE:
+			writeaddr(file, daddress, daddrlen);
+			res = i2c_smbus_read_byte(file);
+			break;
+		case I2C_SMBUS_WORD_DATA:
+			res = i2c_smbus_read_word_data(file, daddress);
+			break;
+		default: /* I2C_SMBUS_BYTE_DATA */
+			res = i2c_smbus_read_byte_data(file, daddress);
+		}
+	}
+
 	close(file);
 
-	if (res < 0) {
-		fprintf(stderr, "Error: Read failed\n");
-		exit(2);
+	if (length) {
+		if (length != res) {
+			fprintf(stderr, "Error: Read failed\n");
+			exit(2);
+		}
+		switch (length) {
+		/* Print the following as one number */
+		case 1: case 2: case 4: case 8:
+			printf("0x");
+			for (i = 0; i < length; i++)
+				printf("%02X", resbufptr[i]);
+			printf("\n");
+			break;
+		/* Print anything else as separate byte values */
+		default:
+			for (i = 0; i < length; i++) {
+				if (i > 0)
+					printf(" ");
+				printf("0x%02X", resbufptr[i]);
+			}
+			printf("\n");
+		}
+		free(resbufptr);
+	}
+	else {
+		if (res < 0) {
+			fprintf(stderr, "Error: Read failed\n");
+			exit(2);
+		}
+
+		printf("0x%0*x\n", size == I2C_SMBUS_WORD_DATA ? 4 : 2, res);
 	}
 
-	printf("0x%0*x\n", size == I2C_SMBUS_WORD_DATA ? 4 : 2, res);
-
-	exit(0);
+	return 0;
 }
